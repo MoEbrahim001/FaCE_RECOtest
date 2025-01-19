@@ -1,41 +1,46 @@
-from flask import Flask, request, jsonify, send_from_directory
+import os
+import logging
+import time
+import threading
+import pyodbc
+import cv2
+import face_recognition
+from sklearn.neighbors import NearestNeighbors
+from flask import Flask, jsonify, request, send_from_directory
 from werkzeug.utils import secure_filename
 from flask_cors import CORS
-import face_recognition
-import cv2
-import os
-import numpy as np
-from PIL import Image
-import pyodbc
-import logging
-from sklearn.neighbors import NearestNeighbors
 
-# Initialize Flask app
+# Configure the logging
+logging.basicConfig(level=logging.INFO)
+
+# Set up Flask app
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "http://localhost:4200"}})
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+# Path to the folder where the images are stored
+IMAGE_FOLDER = r"C:\Users\dell\source\repos\PatientSystem\images"  # Replace with your actual path
+UPLOAD_FOLDER = r"C:\Users\dell\source\repos\PatientSystem\uploads"  # Path for uploaded files
+base_url = "http://localhost:5000"  # Replace with your actual base URL
 
-# Configure paths
-UPLOAD_FOLDER = 'uploads'
-IMAGE_FOLDER = r'C:\Users\dell\source\repos\PatientSystem\images'
-if not os.path.exists(UPLOAD_FOLDER):
-    os.makedirs(UPLOAD_FOLDER)
+# Flag to ensure initialization happens only once
+encodings_initialized = False
+encodings_lock = threading.Lock()
 
+# Initialize the SimpleFacerec class
 class SimpleFacerec:
     def __init__(self):
         self.known_face_encodings = []
         self.known_face_names = []
         self.patient_data = {}
         self.knn = None
+        self.lock = threading.Lock()
 
     def connect_to_database(self):
         try:
             connection = pyodbc.connect(
                 'DRIVER={SQL Server};'
-                'SERVER=DESKTOP-CLQGA5Q\\SQLEXPRESS;'
-                'DATABASE=PatientSystemDB;'
+                'SERVER=DESKTOP-CLQGA5Q\\SQLEXPRESS;'  # Replace with your server
+                'DATABASE=PatientSystemDB;'  # Replace with your database name
                 'Trusted_Connection=yes;'
             )
             return connection
@@ -43,8 +48,10 @@ class SimpleFacerec:
             logging.error(f"Database connection error: {e}")
             return None
 
-    def load_encoding_images(self, base_url):
+    def load_encoding_images(self):
         logging.info("Loading face encodings...")
+        start_time = time.time()
+
         connection = self.connect_to_database()
         if connection is None:
             return
@@ -53,6 +60,10 @@ class SimpleFacerec:
             cursor = connection.cursor()
             cursor.execute("SELECT Id, Name, Dob, Mobileno, Nationalno, FaceImg FROM dbo.Patients")
             patients = cursor.fetchall()
+
+            if not patients:
+                logging.warning("No patient data found in the database.")
+                return
 
             encodings = []
             names = []
@@ -67,16 +78,8 @@ class SimpleFacerec:
                     logging.warning(f"Image file {face_img} not found at path: {image_file}")
                     continue
 
-                # Skip unnecessary processing of image; just convert .png to .jpg directly
-                if image_file.lower().endswith(".jpg"):
-                    compressed_image_path = image_file.replace(".png", ".jpg")
-                    with Image.open(image_file) as img:
-                        img = img.convert("RGB")
-                        img.save(compressed_image_path, "JPEG", quality=75)
-                    image_file = compressed_image_path
-
-                # Now load the image for encoding
                 img = cv2.imread(image_file)
+                img = cv2.resize(img, (320, 320))
                 rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
                 encodings_in_image = face_recognition.face_encodings(rgb_img)
@@ -96,7 +99,7 @@ class SimpleFacerec:
                     "faceImg": face_img_url
                 }
 
-            if encodings:  # Ensure encodings are not empty
+            if encodings:
                 self.knn = NearestNeighbors(n_neighbors=1, algorithm='ball_tree')
                 self.knn.fit(encodings)
 
@@ -108,27 +111,31 @@ class SimpleFacerec:
             else:
                 logging.warning("No face encodings were loaded.")
 
+        except Exception as e:
+            logging.error(f"Error loading encodings: {e}")
         finally:
             connection.close()
 
-    def compare_faces(self, unknown_image):
-        unknown_encoding = face_recognition.face_encodings(unknown_image)
+    def compare_faces(self, unknown_image, tolerance=0.5):
+        small_image = cv2.resize(unknown_image, (320, 240))
+        unknown_encoding = face_recognition.face_encodings(small_image)
         if not unknown_encoding:
             logging.warning("No face found in the image.")
             return None
 
-        unknown_encoding = unknown_encoding[0]
-        distances, indices = self.knn.kneighbors([unknown_encoding])
-
-        if distances[0][0] < 0.6:
-            matched_name = self.known_face_names[indices[0][0]]
-            return matched_name
+        distances, indices = self.knn.kneighbors([unknown_encoding[0]], n_neighbors=1)
+        if distances[0][0] < tolerance:
+            return self.known_face_names[indices[0][0]]
         return None
 
+
+# Flask route for serving images
 @app.route('/images/<path:filename>')
 def serve_images(filename):
     return send_from_directory(IMAGE_FOLDER, filename)
 
+
+# Route to detect face and find matching patient
 @app.route('/detectAndFind', methods=['POST'])
 def detect_and_find():
     if 'file' not in request.files:
@@ -142,29 +149,14 @@ def detect_and_find():
     file_path = os.path.join(UPLOAD_FOLDER, filename)
     file.save(file_path)
 
-    # Skip unnecessary PNG to JPG compression
-    if file_path.lower().endswith(".png"):
-        compressed_file_path = file_path.replace(".png", ".jpg")
-        with Image.open(file_path) as img:
-            img = img.convert("RGB")
-            img.save(compressed_file_path, "JPEG", quality=75)
-        os.remove(file_path)
-        file_path = compressed_file_path
-
-    # Load image for face recognition
     unknown_image = face_recognition.load_image_file(file_path)
 
-    # Load face encodings
-    base_url = f"{request.scheme}://{request.host}"
-    facerec = SimpleFacerec()
-    facerec.load_encoding_images(base_url)
-
-    # Ensure knn model is initialized and encodings are loaded
     if not facerec.knn:
         logging.error("KNN model is not initialized or no face encodings are loaded.")
         return jsonify({"error": "Face encodings are not available."}), 500
 
-    matched_name = facerec.compare_faces(unknown_image)
+    tolerance = 0.5
+    matched_name = facerec.compare_faces(unknown_image, tolerance)
     os.remove(file_path)
 
     if matched_name:
@@ -173,5 +165,43 @@ def detect_and_find():
 
     return jsonify({"isMatch": False, "patientName": "Unknown", "patientData": {}})
 
+
+# Route to reload encodings (e.g., after a database update)
+@app.route('/reload_encodings', methods=['GET'])
+def reload_encodings():
+    try:
+        facerec.known_face_encodings.clear()
+        facerec.known_face_names.clear()
+        facerec.patient_data.clear()
+
+        facerec.load_encoding_images()
+        logging.info("Encodings reloaded successfully.")
+        return jsonify({"message": "Encodings reloaded successfully."}), 200
+
+    except Exception as e:
+        logging.error(f"Error during reload: {e}")
+        return jsonify({"error": "Failed to reload encodings.", "details": str(e)}), 500
+
+
+# Initialize the SimpleFacerec instance
+facerec = SimpleFacerec()
+
+# Function to load encodings after the app restarts
+def load_encodings_on_restart():
+    logging.info("Flask server restarted, loading face encodings...")
+    facerec.load_encoding_images()
+    logging.info("Face encodings initialized successfully.")
+
+# Start a separate thread to load encodings after Flask restarts
+def start_load_encodings_thread():
+    while True:
+        # Ensure the encodings are loaded before requests come in
+        time.sleep(1)
+        if not encodings_initialized:
+            load_encodings_on_restart()
+            break
+# Ensure that encodings are loaded after server restarts
 if __name__ == '__main__':
+    # Start thread to load encodings after server restart
+    threading.Thread(target=start_load_encodings_thread, daemon=True).start()
     app.run(debug=True)
